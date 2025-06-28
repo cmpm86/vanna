@@ -2,7 +2,6 @@
 
 // import { useNetwork } from "@/app/context/network-context";
 // import { ARBITRUM_NETWORK } from "@/app/lib/constants";
-import { generateDummyData } from "@/app/lib/helper";
 import FutureDropdown from "@/app/ui/future/future-dropdown";
 // import OptionSlider from "@/app/ui/options/option-slider";
 import PositionsSection from "@/app/ui/options/positions-section";
@@ -12,18 +11,17 @@ import axios from "axios";
 // import { useWeb3React } from "@web3-react/core";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
+import { deriveService } from "@/app/lib/services/derive-service";
+
+/**
+ * FOChainData - Option Chain Data Integration
+ * 
+ * This component fetches and displays option chain data from the Derive protocol
+ * using WebSocket API. It replaces the dummy data with real-time market data.
+ */
 
 type OptionType = "All" | "Calls" | "Puts";
-type DateOption =
-  | "2 Sep"
-  | "3 Sep"
-  | "4 Sep"
-  | "10 Sep"
-  | "20 Sep"
-  | "28 Sep"
-  | "3 Oct"
-  | "16 Oct"
-  | "Next month";
+type DateOption = string;
 type GreekOption = "Delta" | "Mark Price" | "Gamma" | "Vega" | "Theta";
 
 export default function Page() {
@@ -43,16 +41,7 @@ export default function Page() {
   ]);
 
   const optionTypes: OptionType[] = ["All", "Calls", "Puts"];
-  const dateOptions: DateOption[] = [
-    "2 Sep",
-    "3 Sep",
-    "4 Sep",
-    "10 Sep",
-    "20 Sep",
-    "28 Sep",
-    "3 Oct",
-    "16 Oct",
-  ];
+  const [dateOptions, setDateOptions] = useState<DateOption[]>([]);
   const greekOptions: GreekOption[] = [
     "Delta",
     "Mark Price",
@@ -88,6 +77,38 @@ export default function Page() {
       prev.includes(greek) ? prev.filter((g) => g !== greek) : [...prev, greek]
     );
   };
+  
+  // Update countdown for 0 DTE to 1PM
+  const updateDTECountdown = () => {
+    const now = new Date();
+    const targetTime = new Date();
+    targetTime.setHours(13, 0, 0, 0); // Set to 1 PM
+    
+    // If it's already past 1 PM, set to tomorrow 1 PM
+    if (now > targetTime) {
+      targetTime.setDate(targetTime.getDate() + 1);
+    }
+    
+    const diffMs = targetTime.getTime() - now.getTime();
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+    const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    const diffSeconds = Math.floor((diffMs % (1000 * 60)) / 1000);
+    
+    setFormattedDateDisplay(`0 DTE - ${diffHours}h ${diffMinutes}m ${diffSeconds}s`);
+  };
+  
+  // Compare current and previous values to determine flash direction
+  const compareValues = (currentValue: number | undefined, previousValue: number | undefined, key: string) => {
+    if (currentValue === undefined || previousValue === undefined) return '';
+    
+    if (currentValue > previousValue) {
+      return 'flash-increase';
+    } else if (currentValue < previousValue) {
+      return 'flash-decrease';
+    }
+    
+    return '';
+  };
 
   const date = new Date();
   const today =
@@ -97,9 +118,13 @@ export default function Page() {
     "-" +
     String(date.getDate()).padStart(2, "0");
 
-  const currentPrice = 2417.75;
-  const baseStrike = Math.floor(currentPrice / 100) * 100 - 300;
-  const dummyData = generateDummyData(baseStrike, 6);
+  const [optionChains, setOptionChains] = useState<any[]>([]);
+  const [currentOptionChain, setCurrentOptionChain] = useState<any | null>(null);
+  const [previousOptionChain, setPreviousOptionChain] = useState<any | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [subscriptionId, setSubscriptionId] = useState<string | null>(null);
+  const [flashingCells, setFlashingCells] = useState<Record<string, 'increase' | 'decrease'>>({});
+  const [formattedDateDisplay, setFormattedDateDisplay] = useState<string>('');
 
   // const tableRef = useRef<HTMLDivElement>(null);
   // const [labelPosition, setLabelPosition] = useState<number>(0);
@@ -138,7 +163,7 @@ export default function Page() {
 
   const getPriceFromAssetsArray = (
     tokenSymbol: string,
-    assets: MuxPriceFetchingResponseObject[]
+    assets: any[]
   ) => {
     tokenSymbol =
       tokenSymbol === "WETH" || tokenSymbol === "WBTC"
@@ -163,13 +188,175 @@ export default function Page() {
     return price;
   };
 
+  const [error, setError] = useState<string | null>(null);
+  const [availableCurrencies, setAvailableCurrencies] = useState<string[]>([]);
+
+  const fetchAvailableCurrencies = async () => {
+    try {
+      const currencies = await deriveService.getAllCurrencies();
+      const currencyCodes = currencies.map((c: any) => c.currency);
+      setAvailableCurrencies(currencyCodes);
+      console.log('Available currencies:', currencyCodes);
+      return currencyCodes;
+    } catch (error) {
+      console.error('Error fetching available currencies:', error);
+      // Fallback to hardcoded currencies if API fails
+      const fallbackCurrencies = ['BTC', 'ETH'];
+      setAvailableCurrencies(fallbackCurrencies);
+      return fallbackCurrencies;
+    }
+  };
+
+  const fetchOptionChainData = async () => {
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      console.log('Fetching option chain data...');
+      const currency = selectedPair.value;
+      
+      // Check if we have fetched available currencies
+      if (availableCurrencies.length === 0) {
+        const currencies = await fetchAvailableCurrencies();
+        if (!currencies.includes(currency)) {
+          setError(`Currency ${currency} is not available on the Derive API. Available currencies: ${currencies.join(', ')}`);
+          setOptionChains([]);
+          setDateOptions([]);
+          setCurrentOptionChain(null);
+          setIsLoading(false);
+          return;
+        }
+      } else if (!availableCurrencies.includes(currency)) {
+        setError(`Currency ${currency} is not available on the Derive API. Available currencies: ${availableCurrencies.join(', ')}`);
+        setOptionChains([]);
+        setDateOptions([]);
+        setCurrentOptionChain(null);
+        setIsLoading(false);
+        return;
+      }
+      
+      // Unsubscribe from previous subscription if exists
+      if (subscriptionId) {
+        console.log(`Unsubscribing from previous option chain updates (${subscriptionId})`);
+        deriveService.unsubscribeFromOptionChain(subscriptionId);
+        setSubscriptionId(null);
+      }
+      
+      // Initial fetch
+      const chains = await deriveService.getOptionChain(currency);
+      console.log(`Received ${chains.length} option chains`);
+      
+      if (chains.length === 0) {
+        setError(`No option data found for ${currency}. The currency might not have any options available.`);
+        setOptionChains([]);
+        setDateOptions([]);
+        setCurrentOptionChain(null);
+        return;
+      }
+      
+      setOptionChains(chains);
+      
+      // Extract expiry dates for the dropdown
+      const dates = chains.map(chain => chain.expiryDate);
+      setDateOptions(dates);
+      
+      // Set default selected date to the first available expiry
+      if (dates.length > 0) {
+        setSelectedDate(dates[0]);
+        setCurrentOptionChain(chains[0]);
+      }
+      
+      // Subscribe to real-time updates
+      console.log(`Subscribing to real-time updates for ${currency} option chain`);
+      const newSubscriptionId = await deriveService.subscribeToOptionChain(currency, (updatedChains) => {
+        console.log(`Received real-time update for ${currency} option chain`);
+        setOptionChains(updatedChains);
+        
+        // Update current option chain if date matches
+        if (selectedDate) {
+          const updatedChain = updatedChains.find(chain => chain.expiryDate === selectedDate);
+          if (updatedChain) {
+            setCurrentOptionChain(updatedChain);
+          }
+        }
+      });
+      
+      setSubscriptionId(newSubscriptionId);
+      console.log(`Subscribed to ${currency} option chain updates with ID: ${newSubscriptionId}`);
+      
+    } catch (error) {
+      console.error('Error fetching option chain data:', error);
+      setError('Failed to fetch option chain data. Please try again later.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  // Fetch available currencies on component mount
+  useEffect(() => {
+    fetchAvailableCurrencies();
+  }, []);
+
   useEffect(() => {
     selectedPairRef.current = selectedPair;
+    fetchOptionChainData();
   }, [selectedPair]);
 
   useEffect(() => {
-    const intervalId = setInterval(getAssetPrice, 1000); // Calls fetchData every second
-    return () => clearInterval(intervalId); // This is the cleanup function
+    // Find the option chain that matches the selected date
+    if (optionChains.length > 0 && selectedDate) {
+      const chain = optionChains.find(chain => chain.expiryDate === selectedDate);
+      
+      // Save previous chain for comparison
+      if (currentOptionChain) {
+        setPreviousOptionChain(currentOptionChain);
+      }
+      
+      setCurrentOptionChain(chain || null);
+    }
+  }, [selectedDate, optionChains]);
+  
+  // Format the date display based on the selected date
+  useEffect(() => {
+    if (!selectedDate) return;
+    
+    if (selectedDate.startsWith('0 DTE')) {
+      // Initial update
+      updateDTECountdown();
+      
+      // Set up interval for continuous updates
+      const timerId = setInterval(updateDTECountdown, 1000);
+      return () => clearInterval(timerId);
+    } else {
+      setFormattedDateDisplay(selectedDate);
+    }
+  }, [selectedDate]);
+  
+  // Clear flashing cells after animation completes
+  useEffect(() => {
+    if (Object.keys(flashingCells).length > 0) {
+      const timer = setTimeout(() => {
+        setFlashingCells({});
+      }, 1000);
+      
+      return () => clearTimeout(timer);
+    }
+  }, [flashingCells]);
+
+  useEffect(() => {
+    const intervalId = setInterval(getAssetPrice, 5000); // Update price every 5 seconds
+    
+    return () => {
+      clearInterval(intervalId);
+      
+      // Clean up subscription
+      if (subscriptionId) {
+        console.log(`Cleaning up subscription: ${subscriptionId}`);
+        deriveService.unsubscribeFromOptionChain(subscriptionId);
+      }
+      
+      deriveService.disconnect(); // Clean up WebSocket connection
+    };
   }, []);
 
   return (
@@ -297,7 +484,7 @@ export default function Page() {
                     Calls
                   </th>
                   <th className="py-3 text-center text-nowrap w-24" colSpan={1}>
-                    {today}
+                    {selectedDate?.startsWith('0 DTE') ? formattedDateDisplay : selectedDate || today}
                   </th>
                   <th className="py-3 px-6 text-center" colSpan={7}>
                     Puts
@@ -352,67 +539,114 @@ export default function Page() {
                 </tr>
               </thead>
               <tbody className="text-xs font-normal">
-                {dummyData.map((option, index) => (
-                  <tr key={index}>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.delta.toFixed(5)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.iv.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.volume.toFixed(0)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.bidSize.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSuccess-300 hover:bg-baseSuccess-100">
-                      <div className=" flex flex-row justify-between">
-                        {option.bidPrice.toFixed(1)}
-                        <PlusSquare size={16} />
-                      </div>
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSecondary-500 hover:bg-baseSecondary-300">
-                      <div className=" flex flex-row justify-between">
-                        {option.askPrice.toFixed(1)}
-                        <PlusSquare size={16} />
-                      </div>
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.askSize.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-center border-x border-neutral-100 dark:border-neutral-700 font-medium w-24">
-                      {option.strike}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.bidSize.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSuccess-300 hover:bg-baseSuccess-100">
-                      <div className=" flex flex-row justify-between">
-                        {option.bidPrice.toFixed(1)}
-                        <PlusSquare size={16} />
-                      </div>
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSecondary-500 hover:bg-baseSecondary-300">
-                      <div className=" flex flex-row justify-between">
-                        {option.askPrice.toFixed(1)}
-                        <PlusSquare size={16} />
-                      </div>
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.askSize.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.volume.toFixed(0)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.iv.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
-                      {option.delta.toFixed(5)}
+                {isLoading ? (
+                  <tr>
+                    <td colSpan={15} className="py-10 text-center">
+                      Loading option chain data...
                     </td>
                   </tr>
-                ))}
+                ) : error ? (
+                  <tr>
+                    <td colSpan={15} className="py-10 text-center text-baseSecondary-500">
+                      {error}
+                      <div className="mt-2">
+                        <button 
+                          onClick={fetchOptionChainData}
+                          className="px-4 py-2 bg-purple text-white rounded-md text-sm"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ) : currentOptionChain ? (
+                  currentOptionChain.options.calls.map((call: any, index: number) => {
+                    const put = currentOptionChain.options.puts.find(
+                      (p: any) => p.strike === call.strike
+                    );
+                    return (
+                      <tr key={index}>
+                        <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                          {call.delta?.toFixed(5) || '-'}
+                        </td>
+                        <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                          {call.iv?.toFixed(2) || '-'}
+                        </td>
+                        <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                          {call.volume?.toFixed(0) || '-'}
+                        </td>
+                        <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                          {call.bidSize?.toFixed(2) || '-'}
+                        </td>
+                        <td className={`py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSuccess-300 hover:bg-baseSuccess-100 ${previousOptionChain ? compareValues(call.bidPrice, previousOptionChain.options.calls.find((p: any) => p.strike === call.strike)?.bidPrice, `call-bid-${call.strike}`) : ''}`}>
+                          <div className="flex flex-row justify-between">
+                            {call.bidPrice?.toFixed(1) || '-'}
+                            <PlusSquare size={16} />
+                          </div>
+                        </td>
+                        <td className={`py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSecondary-500 hover:bg-baseSecondary-300 ${previousOptionChain ? compareValues(call.askPrice, previousOptionChain.options.calls.find((p: any) => p.strike === call.strike)?.askPrice, `call-ask-${call.strike}`) : ''}`}>
+                          <div className="flex flex-row justify-between">
+                            {call.askPrice?.toFixed(1) || '-'}
+                            <PlusSquare size={16} />
+                          </div>
+                        </td>
+                        <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                          {call.askSize?.toFixed(2) || '-'}
+                        </td>
+                        <td className="py-3 px-2 text-center border-x border-neutral-100 dark:border-neutral-700 font-medium w-24">
+                          {call.strike}
+                        </td>
+                        {put ? (
+                          <>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                              {put.bidSize?.toFixed(2) || '-'}
+                            </td>
+                            <td className={`py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSuccess-300 hover:bg-baseSuccess-100 ${previousOptionChain ? compareValues(put.bidPrice, previousOptionChain.options.puts.find((p: any) => p.strike === put.strike)?.bidPrice, `put-bid-${put.strike}`) : ''}`}>
+                              <div className="flex flex-row justify-between">
+                                {put.bidPrice?.toFixed(1) || '-'}
+                                <PlusSquare size={16} />
+                              </div>
+                            </td>
+                            <td className={`py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700 text-baseSecondary-500 hover:bg-baseSecondary-300 ${previousOptionChain ? compareValues(put.askPrice, previousOptionChain.options.puts.find((p: any) => p.strike === put.strike)?.askPrice, `put-ask-${put.strike}`) : ''}`}>
+                              <div className="flex flex-row justify-between">
+                                {put.askPrice?.toFixed(1) || '-'}
+                                <PlusSquare size={16} />
+                              </div>
+                            </td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                              {put.askSize?.toFixed(2) || '-'}
+                            </td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                              {put.volume?.toFixed(0) || '-'}
+                            </td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                              {put.iv?.toFixed(2) || '-'}
+                            </td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">
+                              {put.delta?.toFixed(5) || '-'}
+                            </td>
+                          </>
+                        ) : (
+                          <>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                            <td className="py-3 px-2 text-left border-b border-neutral-100 dark:border-neutral-700">-</td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })
+                ) : (
+                  <tr>
+                    <td colSpan={15} className="py-10 text-center">
+                      No option chain data available
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
             {/* <div
